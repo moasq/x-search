@@ -1,0 +1,31 @@
+{
+  "name": "x-search",
+  "version": "0.2.0",
+  "description": "Search X/Twitter posts, profiles, and threads from Claude Code through xAI's built-in x_search Responses tool, with citations and media-aware search.",
+  "author": {
+    "name": "Abdullah Alrashoudi"
+  },
+  "homepage": "https://github.com/Abdullah4AI/x-search",
+  "repository": "https://github.com/Abdullah4AI/x-search",
+  "license": "MIT",
+  "keywords": [
+    "x",
+    "twitter",
+    "xai",
+    "grok",
+    "search",
+    "mcp"
+  ],
+  "mcpServers": {
+    "x-search": {
+      "command": "python3",
+      "args": [
+        "-u",
+        "${CLAUDE_PLUGIN_ROOT}/scripts/x_search_mcp_server.py"
+      ],
+      "env": {
+        "X_SEARCH_HOME": "${HOME}/.codex-x-search"
+      }
+    }
+  }
+}

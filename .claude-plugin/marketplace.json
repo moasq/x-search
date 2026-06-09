@@ -1,0 +1,27 @@
+{
+  "name": "x-search",
+  "owner": {
+    "name": "Abdullah Alrashoudi",
+    "url": "https://github.com/Abdullah4AI/x-search"
+  },
+  "metadata": {
+    "description": "X Search marketplace — a standalone plugin exposing an x_search MCP tool backed by xAI/Grok.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "x-search",
+      "source": "./plugins/x-search",
+      "description": "Search X/Twitter posts, profiles, and threads from Claude Code through xAI's built-in x_search Responses tool, with citations and media-aware search.",
+      "version": "0.2.0",
+      "category": "research",
+      "keywords": [
+        "x",
+        "twitter",
+        "xai",
+        "grok",
+        "search"
+      ]
+    }
+  ]
+}

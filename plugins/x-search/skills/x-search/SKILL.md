@@ -1,6 +1,6 @@
 ---
 name: x-search
-description: Search X/Twitter posts, profiles, and threads from Codex using the plugin's x_search MCP tool backed by xAI/Grok. Use when the user asks for current X discussion, reactions, posts from specific handles, X citations, or X media-aware search.
+description: Search X/Twitter posts, profiles, and threads using the plugin's x_search MCP tool backed by xAI/Grok. Use when the user asks for current X discussion, reactions, posts from specific handles, X citations, or X media-aware search.
 ---
 
 # X Search
