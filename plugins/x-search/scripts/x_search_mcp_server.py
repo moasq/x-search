@@ -27,9 +27,15 @@ import urllib.request
 import uuid
 import webbrowser
 from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from x_search_research import (
+    REASONING_EFFORTS, collect_sources, normalize_handle, research_arguments,
+    research_schema, source_warnings,
+)
 
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
@@ -52,12 +58,12 @@ DEFAULT_CA_BUNDLE_PATHS = (
     "/etc/pki/tls/certs/ca-bundle.crt",
 )
 XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
-MAX_HANDLES = 10
+MAX_HANDLES = 20
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 MAX_ERROR_BYTES = 16 * 1024
 MAX_MCP_CONTENT_LENGTH = 5 * 1024 * 1024
 SERVER_NAME = "x-search"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 
 
@@ -72,13 +78,13 @@ X_SEARCH_INPUT_SCHEMA: Dict[str, Any] = {
             "type": "array",
             "items": {"type": "string"},
             "maxItems": MAX_HANDLES,
-            "description": "Optional list of X handles to include exclusively (max 10).",
+            "description": "Optional list of X handles to include exclusively (max 20).",
         },
         "excluded_x_handles": {
             "type": "array",
             "items": {"type": "string"},
             "maxItems": MAX_HANDLES,
-            "description": "Optional list of X handles to exclude (max 10).",
+            "description": "Optional list of X handles to exclude (max 20).",
         },
         "from_date": {
             "type": "string",
@@ -99,6 +105,18 @@ X_SEARCH_INPUT_SCHEMA: Dict[str, Any] = {
             "type": "boolean",
             "description": "Whether xAI should analyze videos attached to matching X posts.",
             "default": False,
+        },
+        "reasoning_effort": {
+            "type": "string", "enum": list(REASONING_EFFORTS),
+            "description": "Optional reasoning effort; use only with a model that supports it.",
+        },
+        "timeout_seconds": {
+            "type": "integer", "minimum": 10, "maximum": 300,
+            "description": "Search retry budget in seconds. Attempts use the remaining time as their socket timeout.",
+        },
+        "require_citations": {
+            "type": "boolean", "default": False,
+            "description": "Return a tool error if no X citation is supplied or the response is incomplete.",
         },
     },
     "required": ["query"],
@@ -160,11 +178,25 @@ X_SEARCH_TOOL: Dict[str, Any] = {
     "description": (
         "Search X posts, profiles, and threads using xAI's built-in x_search "
         "Responses tool. Use this for current discussion, reactions, or claims "
-        "on X rather than general web pages. Authentication must be completed "
-        "with x_search_auth before this tool is used."
+        "on X rather than general web pages. Returns a search sample with citation "
+        "metadata, not raw timelines. Requires configured xAI OAuth or an API key."
     ),
     "inputSchema": X_SEARCH_INPUT_SCHEMA,
 }
+
+RESEARCH_TOOLS = [
+    {
+        "name": f"x_search_{kind}",
+        "description": description,
+        "inputSchema": research_schema(kind, X_SEARCH_INPUT_SCHEMA["properties"]),
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+    }
+    for kind, description in (
+        ("account", "Research one public X account's recent posts and themes with citations. Returns a search sample, not a complete or authenticated timeline. Citation evidence is required by default."),
+        ("thread", "Research a public X post, author continuations, and replies by exact URL. Returns a cited search sample, not an exhaustive reply export. Citation evidence is required by default."),
+    )
+]
+X_SEARCH_TOOL["annotations"] = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}
 
 
 X_SEARCH_AUTH_TOOL: Dict[str, Any] = {
@@ -319,19 +351,27 @@ def _x_search_config() -> Dict[str, Any]:
     )
 
     try:
-        timeout_seconds = max(30, int(str(timeout_raw)))
+        timeout_seconds = min(300, max(10, int(str(timeout_raw))))
     except Exception:
         timeout_seconds = DEFAULT_X_SEARCH_TIMEOUT_SECONDS
 
     try:
-        retries = max(0, int(str(retries_raw)))
+        retries = min(3, max(0, int(str(retries_raw))))
     except Exception:
         retries = DEFAULT_X_SEARCH_RETRIES
 
+    reasoning_effort = str(_env_value("X_SEARCH_REASONING_EFFORT") or cfg.get("reasoning_effort") or "").strip().lower()
+    if reasoning_effort and reasoning_effort not in REASONING_EFFORTS:
+        raise XSearchError("reasoning_effort must be one of: " + ", ".join(REASONING_EFFORTS))
+    credential_preference = str(_env_value("X_SEARCH_CREDENTIAL_PREFERENCE") or cfg.get("credential_preference") or "oauth").strip().lower()
+    if credential_preference not in {"oauth", "api_key"}:
+        raise XSearchError("credential_preference must be oauth or api_key")
     return {
         "model": str(model).strip() or DEFAULT_X_SEARCH_MODEL,
         "timeout_seconds": timeout_seconds,
         "retries": retries,
+        "reasoning_effort": reasoning_effort or None,
+        "credential_preference": credential_preference,
     }
 
 
@@ -1067,6 +1107,10 @@ def _resolve_xai_credentials(
     *,
     force_refresh: bool = False,
 ) -> Tuple[str, str, str]:
+    api_key = str(_env_value("XAI_API_KEY") or "").strip()
+    if api_key and _x_search_config()["credential_preference"] == "api_key":
+        base_url = _validate_base_url(str(_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL), "xai")
+        return api_key, base_url, "xai"
     oauth_error: Optional[XSearchError] = None
     try:
         oauth = _resolve_oauth_credentials(timeout_seconds, force_refresh=force_refresh)
@@ -1075,7 +1119,6 @@ def _resolve_xai_credentials(
     except XSearchError as exc:
         oauth_error = exc
 
-    api_key = str(_env_value("XAI_API_KEY") or "").strip()
     if api_key:
         base_url = _validate_base_url(str(_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL), "xai")
         return api_key, base_url, "xai"
@@ -1116,8 +1159,13 @@ def _normalize_handles(value: Any, field_name: str) -> List[str]:
     for handle in items:
         if not isinstance(handle, str):
             raise XSearchError(f"{field_name} must contain only strings")
-        normalized = handle.strip().lstrip("@")
-        if normalized:
+        if not handle.strip():
+            continue
+        try:
+            normalized = normalize_handle(handle)
+        except ValueError as exc:
+            raise XSearchError(f"{field_name}: {exc}") from exc
+        if normalized.lower() not in {h.lower() for h in cleaned}:
             cleaned.append(normalized)
     if len(cleaned) > MAX_HANDLES:
         raise XSearchError(f"{field_name} supports at most {MAX_HANDLES} handles")
@@ -1153,6 +1201,8 @@ def _int_arg(
 
 def _parse_iso_date(value: str, field_name: str) -> date:
     raw = value.strip()
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", raw):
+        raise XSearchError(f"{field_name} must be YYYY-MM-DD (got {raw!r})")
     try:
         return datetime.strptime(raw, "%Y-%m-%d").date()
     except ValueError as exc:
@@ -1329,6 +1379,72 @@ def _post_json(
         return _read_json_response(response)
 
 
+def _retry_after_seconds(headers: Any) -> Optional[float]:
+    raw = str((headers or {}).get("Retry-After", "")).strip()
+    if not raw:
+        return None
+    try:
+        if re.fullmatch(r"[0-9]+", raw):
+            return float(raw)
+        when = parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
+def _search_request(payload, api_key, base_url, source, config, timeout_seconds):
+    """Bound retries by elapsed time; auth refresh has its own one-attempt allowance."""
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+               "Accept": "application/json", "User-Agent": _user_agent()}
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    retries = attempts = 0
+    refreshed = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            error = _tool_error("x_search", "X search request budget exhausted", "TimeoutError")
+            break
+        attempts += 1
+        delay = min(5.0, 1.5 * (retries + 1))
+        try:
+            data = _post_json(f"{base_url}/responses", headers, payload, min(timeout_seconds, remaining))
+            return data, source, {"attempts": attempts, "elapsed_seconds": round(time.monotonic() - started, 3)}, None
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            retry_after = _retry_after_seconds(exc.headers)
+            message = _http_error_message(exc)
+            if status == 401 and source == "xai-oauth" and not refreshed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    error = _tool_error("x_search", "X search request budget exhausted", "TimeoutError")
+                    break
+                api_key, base_url, source = _resolve_xai_credentials(remaining, force_refresh=True)
+                headers["Authorization"] = f"Bearer {api_key}"
+                refreshed = True
+                continue
+            error = _tool_error("x_search", message, "HTTPError")
+            error["http_status"] = status
+            error["retryable"] = status == 429 or 500 <= status < 600
+            if retry_after is not None:
+                error["retry_after_seconds"] = retry_after
+                delay = max(delay, retry_after)
+            if not error["retryable"]:
+                break
+        except (TimeoutError, OSError) as exc:
+            error = _tool_error("x_search", _redact(str(exc)), type(exc).__name__)
+            error["retryable"] = True
+        if retries >= config["retries"] or delay >= deadline - time.monotonic():
+            break
+        retries += 1
+        time.sleep(delay)
+    diagnostics = {"attempts": attempts, "elapsed_seconds": round(time.monotonic() - started, 3)}
+    error["diagnostics"] = diagnostics
+    return None, source, diagnostics, error
+
+
 def x_search_auth_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
     allowed_keys = set(X_SEARCH_AUTH_INPUT_SCHEMA["properties"])
     unknown_keys = sorted(set(arguments) - allowed_keys)
@@ -1409,8 +1525,10 @@ def x_search_status_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
     credential_source: Optional[str] = None
     base_url: Optional[str] = None
     error: Optional[str] = None
+    config = None
     try:
-        timeout_seconds = int(_x_search_config()["timeout_seconds"])
+        config = _x_search_config()
+        timeout_seconds = int(config["timeout_seconds"])
         token, resolved_base_url, source = _resolve_xai_credentials(timeout_seconds)
         authenticated = bool(str(token or "").strip())
         credential_source = source if authenticated else None
@@ -1430,6 +1548,9 @@ def x_search_status_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
         "base_url": base_url,
         "auth_store": str(auth_path),
         "error": error,
+        "server_version": SERVER_VERSION,
+        "config": config,
+        "capabilities": ["search", "account_research", "thread_research", "citation_metadata"],
     }
 
 
@@ -1452,20 +1573,34 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
     if unknown_keys:
         raise XSearchError(f"unknown x_search argument(s): {', '.join(unknown_keys)}")
 
-    query = str(arguments.get("query") or "").strip()
-    if not query:
+    query = arguments.get("query")
+    if not isinstance(query, str) or not query.strip():
         raise XSearchError("query is required for x_search")
+    query = query.strip()
+    if len(query) > 20000:
+        raise XSearchError("query must be at most 20000 characters")
 
     config = _x_search_config()
-    timeout_seconds = int(config["timeout_seconds"])
+    timeout_seconds = config["timeout_seconds"]
+    if "timeout_seconds" in arguments:
+        if isinstance(arguments["timeout_seconds"], bool) or not isinstance(arguments["timeout_seconds"], int):
+            raise XSearchError("timeout_seconds must be an integer")
+        timeout_seconds = _int_arg(arguments, "timeout_seconds", default=timeout_seconds, minimum=10, maximum=300)
+    require_citations = _bool_arg(arguments, "require_citations")
+    reasoning_effort = arguments.get("reasoning_effort", config["reasoning_effort"])
+    if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
+        raise XSearchError("reasoning_effort must be one of: " + ", ".join(REASONING_EFFORTS))
 
     allowed = _normalize_handles(arguments.get("allowed_x_handles"), "allowed_x_handles")
     excluded = _normalize_handles(arguments.get("excluded_x_handles"), "excluded_x_handles")
     if allowed and excluded:
         raise XSearchError("allowed_x_handles and excluded_x_handles cannot be used together")
 
-    from_date = str(arguments.get("from_date") or "").strip()
-    to_date = str(arguments.get("to_date") or "").strip()
+    for field in ("from_date", "to_date"):
+        if field in arguments and not isinstance(arguments[field], str):
+            raise XSearchError(f"{field} must be a string")
+    from_date = arguments.get("from_date", "").strip()
+    to_date = arguments.get("to_date", "").strip()
     _validate_date_range(from_date, to_date)
     enable_image_understanding = _bool_arg(arguments, "enable_image_understanding")
     enable_video_understanding = _bool_arg(arguments, "enable_video_understanding")
@@ -1493,77 +1628,19 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
         "tools": [tool_def],
         "store": False,
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": _user_agent(),
-    }
-
-    response_payload: Optional[Dict[str, Any]] = None
-    last_error: Optional[str] = None
-    force_refreshed = False
-    for attempt in range(int(config["retries"]) + 1):
-        try:
-            response_payload = _post_json(
-                f"{base_url}/responses",
-                headers,
-                payload,
-                timeout_seconds,
-            )
-            break
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401 and source == "xai-oauth" and not force_refreshed:
-                api_key, base_url, source = _resolve_xai_credentials(
-                    timeout_seconds,
-                    force_refresh=True,
-                )
-                headers["Authorization"] = f"Bearer {api_key}"
-                force_refreshed = True
-                continue
-            if exc.code < 500 or attempt >= int(config["retries"]):
-                return {
-                    "success": False,
-                    "provider": "xai",
-                    "tool": "x_search",
-                    "error": _http_error_message(exc),
-                    "error_type": "HTTPError",
-                }
-            last_error = _http_error_message(exc)
-        except TimeoutError as exc:
-            if attempt >= int(config["retries"]):
-                return {
-                    "success": False,
-                    "provider": "xai",
-                    "tool": "x_search",
-                    "error": f"xAI x_search timed out after {timeout_seconds} seconds",
-                    "error_type": type(exc).__name__,
-                }
-            last_error = str(exc)
-        except OSError as exc:
-            if attempt >= int(config["retries"]):
-                return {
-                    "success": False,
-                    "provider": "xai",
-                    "tool": "x_search",
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                }
-            last_error = str(exc)
-        time.sleep(min(5.0, 1.5 * (attempt + 1)))
-
-    if response_payload is None:
-        return {
-            "success": False,
-            "provider": "xai",
-            "tool": "x_search",
-            "error": last_error or "x_search request did not return a response",
-            "error_type": "RuntimeError",
-        }
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
+    response_payload, source, diagnostics, error = _search_request(
+        payload, api_key, base_url, source, config, timeout_seconds,
+    )
+    if error:
+        return error
 
     answer = _extract_response_text(response_payload)
-    citations = list(response_payload.get("citations") or [])
+    raw_citations = response_payload.get("citations")
+    citations = raw_citations if isinstance(raw_citations, list) else []
     inline_citations = _extract_inline_citations(response_payload)
+    sources = collect_sources(citations, inline_citations)
 
     active_filters: List[str] = []
     if allowed:
@@ -1574,10 +1651,20 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
         active_filters.append("from_date")
     if to_date:
         active_filters.append("to_date")
-    degraded = bool(active_filters) and not citations and not inline_citations
+    response_status = response_payload.get("status", "completed")
+    degraded = not sources or response_status != "completed" or not answer
+    if not sources:
+        reason = (f"no citations returned despite filters: {', '.join(active_filters)}" if active_filters and not citations and not inline_citations
+                  else "no usable X citations returned")
+    elif not answer:
+        reason = "provider returned no answer text"
+    elif response_status != "completed":
+        reason = f"provider response status: {response_status}"
+    else:
+        reason = None
 
-    return {
-        "success": True,
+    result = {
+        "success": not (require_citations and degraded),
         "provider": "xai",
         "credential_source": source,
         "tool": "x_search",
@@ -1587,13 +1674,50 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
         "answer": answer,
         "citations": citations,
         "inline_citations": inline_citations,
+        "sources": sources,
+        "source_count": len(sources),
+        "evidence": "x_posts_cited" if any(s["kind"] == "post" for s in sources) else "x_profiles_cited" if sources else "uncited",
+        "coverage": "search_sample",
+        "warnings": source_warnings(sources, allowed, excluded, from_date, to_date),
+        "diagnostics": diagnostics,
+        "response_status": response_status,
+        "usage": response_payload.get("usage") if isinstance(response_payload.get("usage"), dict) else None,
         "degraded": degraded,
-        "degraded_reason": (
-            f"no citations returned despite filters: {', '.join(active_filters)}"
-            if degraded
-            else None
-        ),
+        "degraded_reason": reason,
     }
+    if not result["success"]:
+        result.update(error=reason, error_type="InsufficientEvidence")
+    return result
+
+
+def x_search_research_tool(kind: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    schema = research_schema(kind, X_SEARCH_INPUT_SCHEMA["properties"])
+    unknown = set(arguments) - set(schema["properties"])
+    if unknown:
+        raise XSearchError("unknown research argument(s): " + ", ".join(sorted(unknown)))
+    try:
+        search_args, target = research_arguments(kind, arguments)
+    except ValueError as exc:
+        raise XSearchError(str(exc)) from exc
+    result = x_search_tool(search_args)
+    result["tool"] = f"x_search_{kind}"
+    result["target"] = target
+    if "sources" in result:
+        if kind == "thread":
+            result["target_cited"] = any(s.get("post_id") == target["post_id"] for s in result["sources"])
+            missing_reason = "requested root post was not cited; thread identity is unverified"
+        else:
+            result["target_cited"] = any(
+                s["kind"] == "post" and (s.get("handle") or "").lower() == target["handle"].lower()
+                for s in result["sources"]
+            )
+            missing_reason = "no post from the requested account was cited"
+        if not result["target_cited"]:
+            result["degraded"] = True
+            result["degraded_reason"] = missing_reason
+            if search_args["require_citations"]:
+                result.update(success=False, error=result["degraded_reason"], error_type="InsufficientEvidence")
+    return result
 
 
 def _tool_error(tool_name: str, message: str, error_type: str = "XSearchError") -> Dict[str, Any]:
@@ -1703,6 +1827,8 @@ def _mcp_error(request_id: Any, code: int, message: str) -> Dict[str, Any]:
 def _call_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     handlers = {
         "x_search": x_search_tool,
+        "x_search_account": lambda args: x_search_research_tool("account", args),
+        "x_search_thread": lambda args: x_search_research_tool("thread", args),
         "x_search_auth": x_search_auth_tool,
         "x_search_status": x_search_status_tool,
         "x_search_logout": x_search_logout_tool,
@@ -1743,7 +1869,7 @@ def _handle_mcp_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return _mcp_result(request_id, {})
 
     if method == "tools/list":
-        return _mcp_result(request_id, {"tools": [X_SEARCH_TOOL, *SETUP_TOOLS]})
+        return _mcp_result(request_id, {"tools": [X_SEARCH_TOOL, *RESEARCH_TOOLS, *SETUP_TOOLS]})
 
     if method == "tools/call":
         name = str(params.get("name") or "")

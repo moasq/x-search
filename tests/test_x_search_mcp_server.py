@@ -110,7 +110,7 @@ class XSearchToolTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["credential_source"], "xai")
         self.assertEqual(captured["url"], "https://api.x.ai/v1/responses")
-        self.assertEqual(captured["timeout_seconds"], 31)
+        self.assertAlmostEqual(captured["timeout_seconds"], 31, delta=0.1)
         self.assertEqual(captured["headers"]["Authorization"], "Bearer key")
         self.assertEqual(
             captured["payload"],
@@ -277,7 +277,7 @@ class XSearchToolTests(unittest.TestCase):
             [{"role": "user", "content": "recent posts about xAI"}],
         )
 
-    def test_not_degraded_without_filters_or_with_inline_citation(self):
+    def test_uncited_broad_result_is_degraded_but_inline_citations_count(self):
         inline_payload = {
             "output": [
                 {
@@ -312,8 +312,8 @@ class XSearchToolTests(unittest.TestCase):
             broad = server.x_search_tool({"query": "anything"})
             filtered = server.x_search_tool({"query": "anything", "allowed_x_handles": ["xai"]})
 
-        self.assertFalse(broad["degraded"])
-        self.assertIsNone(broad["degraded_reason"])
+        self.assertTrue(broad["degraded"])
+        self.assertEqual(broad["evidence"], "uncited")
         self.assertFalse(filtered["degraded"])
         self.assertIsNone(filtered["degraded_reason"])
         self.assertEqual(filtered["inline_citations"][0]["url"], "https://x.com/xai/status/1")

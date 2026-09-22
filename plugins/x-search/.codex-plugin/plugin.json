@@ -1,12 +1,12 @@
 {
   "name": "x-search",
-  "version": "0.2.0+codex.20260605151044",
-  "description": "Search X posts and threads from Codex through xAI's built-in x_search Responses tool.",
+  "version": "0.3.0",
+  "description": "Research X posts, public accounts, and threads with citation metadata, bounded retries, and standalone xAI sign-in.",
   "author": {
     "name": "Abdullah Alrashoudi"
   },
-  "homepage": "https://github.com/Abdullah4AI/x-search",
-  "repository": "https://github.com/Abdullah4AI/x-search",
+  "homepage": "https://github.com/moasq/x-search",
+  "repository": "https://github.com/moasq/x-search",
   "license": "MIT",
   "keywords": [
     "x",
@@ -21,15 +21,15 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "X Search",
-    "shortDescription": "Search X posts and threads with xAI citations",
-    "longDescription": "X Search adds a standalone local MCP tool for Codex that calls xAI's built-in x_search Responses tool. It supports handle filters, date ranges, image and video understanding flags, built-in browser-based xAI sign-in, API-key fallback, citations, cert-aware HTTPS calls, faster defaults, latest-post query hinting, retries, and degraded-result detection.",
+    "shortDescription": "Research X accounts and threads with source evidence",
+    "longDescription": "Read-only X research through xAI: general search, account research, thread research, normalized citation records, coverage warnings, configurable reasoning, rate-limit recovery, and request diagnostics. Includes standalone OAuth sign-in and optional API-key preference. Research results are search samples, not complete timelines.",
     "developerName": "Abdullah Alrashoudi",
     "category": "Research",
     "capabilities": [
       "Interactive",
       "Read"
     ],
-    "websiteURL": "https://github.com/Abdullah4AI/x-search",
+    "websiteURL": "https://github.com/moasq/x-search",
     "defaultPrompt": [
       "Search X for reactions to a launch",
       "Find recent posts from @xai",
